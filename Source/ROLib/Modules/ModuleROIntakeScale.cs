@@ -57,15 +57,15 @@ namespace ROLib
 
         #region Private Variables
 
-        private Vector3 baseModelScale = Vector3.one;
         private Vector3[] baseNodePos = new Vector3[0];
+        private Vector3[] baseNodeOrient = new Vector3[0];
         private Vector3 baseSrfNodePos;
         private bool hasSrfNode;
         private float baseAjeArea = -1f;
         private double baseIntakeArea = -1d;
         // the scale last applied (width, height, length): surface-attached children move by the change from it
         private Vector3 appliedScale = Vector3.one;
-        private Transform modelRoot;
+        private Transform scaleRoot;
         private ModuleResourceIntake intake;
         private FieldInfo ajeAreaField;
         private bool ajeResolved;
@@ -87,6 +87,7 @@ namespace ROLib
             base.OnStart(state);
             ResolveAxes();
             CaptureBase();
+            CreateScaleRoot();
             scaleWidth = Mathf.Clamp(scaleWidth, minScale, maxScale);
             scaleHeight = Mathf.Clamp(scaleHeight, minScale, maxScale);
             scaleLength = Mathf.Clamp(scaleLength, minScale, maxScale);
@@ -98,7 +99,6 @@ namespace ROLib
                     this.ROLupdateUIFloatEditControl(name, minScale, maxScale, 0.5f, 0.1f, 0.01f);
                     Fields[name].uiControlEditor.onFieldChanged = OnScaleChanged;
                 }
-                GameEvents.onEditorPartEvent.Add(OnEditorPartEvent);
             }
             // a loaded part is already where its scaled nodes put it: nothing attached is moved
             ApplyScale(false);
@@ -107,21 +107,7 @@ namespace ROLib
         public override void OnStartFinished(StartState state)
         {
             base.OnStartFinished(state);
-            // Part.Start mirrors the part after the modules' OnStart, which sets the model's scale back (Part.SetMirror)
-            ApplyModelScale();
             if (!IsUnscaled) UpdateDragCubes();   // unscaled parts keep their stock drag cubes
-        }
-
-        public void OnDestroy()
-        {
-            GameEvents.onEditorPartEvent.Remove(OnEditorPartEvent);
-        }
-
-        // An attached symmetry counterpart is mirrored as it is attached (Part.updateMirroring), which resets its model's scale too.
-        private void OnEditorPartEvent(ConstructionEventType type, Part p)
-        {
-            if (type == ConstructionEventType.PartAttached && p != null && (p == part || part.symmetryCounterparts.Contains(p)))
-                ApplyModelScale();
         }
 
         // From the prefab, not values captured in OnStart: a craft's cost and mass are also asked of the prefab's modules
@@ -143,7 +129,6 @@ namespace ROLib
         private Part Prefab => part.partInfo != null ? part.partInfo.partPrefab : null;
         private float BaseMass => Prefab is Part prefab ? prefab.mass : part.mass;
         private float BaseCost => part.partInfo != null ? part.partInfo.cost : 0f;
-        private Transform ModelRoot => modelRoot != null ? modelRoot : (modelRoot = part.transform.Find("model"));
         private ModuleResourceIntake Intake => intake != null ? intake : (intake = part.FindModuleImplementing<ModuleResourceIntake>());
 
         private void ResolveAxes()
@@ -175,14 +160,14 @@ namespace ROLib
         private void CaptureBase()
         {
             Part prefab = Prefab;
-            Transform pm = prefab != null ? prefab.transform.Find("model") : null;
-            baseModelScale = pm != null ? pm.localScale : (ModelRoot != null ? ModelRoot.localScale : Vector3.one);
-
             baseNodePos = new Vector3[part.attachNodes.Count];
+            baseNodeOrient = new Vector3[part.attachNodes.Count];
             for (int i = 0; i < part.attachNodes.Count; i++)
             {
                 AttachNode pn = prefab != null ? prefab.attachNodes.Find(n => n.id == part.attachNodes[i].id) : null;
-                baseNodePos[i] = pn != null ? pn.originalPosition : part.attachNodes[i].originalPosition;
+                AttachNode n0 = pn ?? part.attachNodes[i];
+                baseNodePos[i] = n0.originalPosition;
+                baseNodeOrient[i] = n0.originalOrientation;
             }
             AttachNode srf = prefab != null && prefab.srfAttachNode != null ? prefab.srfAttachNode : part.srfAttachNode;
             hasSrfNode = srf != null && part.srfAttachNode != null;
@@ -219,13 +204,23 @@ namespace ROLib
         {
             ApplyModelScale();
 
+            // Part.SetMirror sets position = originalPosition x mirrorVector (and orientation likewise), so original* stays
+            // unmirrored and the live values carry the mirror
+            Vector3 mirror = part.mirrorVector;
             for (int i = 0; i < part.attachNodes.Count && i < baseNodePos.Length; i++)
             {
                 AttachNode node = part.attachNodes[i];
-                ROLAttachNodeUtils.UpdateAttachNodePosition(part, node, Scaled(baseNodePos[i]), node.orientation, userInput, node.size);
+                Vector3 pos = Scaled(baseNodePos[i]);
+                ROLAttachNodeUtils.UpdateAttachNodePosition(part, node, Vector3.Scale(pos, mirror), Vector3.Scale(baseNodeOrient[i], mirror), userInput, node.size);
+                node.originalPosition = pos;
+                node.originalOrientation = baseNodeOrient[i];
             }
             if (hasSrfNode && part.srfAttachNode is AttachNode srf)
+            {
                 ROLAttachNodeUtils.UpdateAttachNodePosition(part, srf, Scaled(baseSrfNodePos), srf.orientation, userInput, srf.size);
+                if (scaleRoot != null && scaleRoot.parent.Find(SrfColliderName) is Transform collider)
+                    collider.position = part.transform.TransformPoint(srf.position);
+            }
 
             var scale = new Vector3(scaleWidth, scaleHeight, scaleLength);
             if (userInput)
@@ -250,13 +245,35 @@ namespace ROLib
         }
 
         /// <summary>
-        /// Model + colliders: per-axis localScale on the model root, mirrored as the part is (Part.SetMirror writes this same
-        /// scale as rescaleFactor x mirrorVector, so the mirror is kept and the scale applied again after it).
+        /// The meshes and colliders go under a transform of their own below "model", which takes the scale. "model" is left
+        /// to KSP: Part.SetMirror sets its scale to rescaleFactor x mirrorVector (on a mirror flip, and on the copy a drag
+        /// cube is rendered from), and that applies on top of this one. A copied part already has it, with its children.
+        /// Looked up directly under "model", not with ROLUtils.GetRootTransform: that searches the part's whole hierarchy,
+        /// child parts included, and would find a scaled child intake's.
         /// </summary>
+        private void CreateScaleRoot()
+        {
+            Transform model = part.transform.Find("model");
+            if (model == null) return;
+            scaleRoot = model.Find(GroupName);
+            if (scaleRoot != null) return;
+            scaleRoot = new GameObject(GroupName).transform;
+            scaleRoot.NestToParent(model);
+            // the stock surface attach collider sits at the surface node, which is moved separately
+            var children = new System.Collections.Generic.List<Transform>();
+            foreach (Transform child in model)
+                if (child != scaleRoot && child.name != SrfColliderName)
+                    children.Add(child);
+            foreach (Transform child in children)
+                child.SetParent(scaleRoot, false);
+        }
+
+        private const string SrfColliderName = "Surface Attach Collider";
+
         private void ApplyModelScale()
         {
-            if (ModelRoot is Transform model)
-                model.localScale = Vector3.Scale(Scaled(baseModelScale), part.mirrorVector);
+            if (scaleRoot != null)
+                scaleRoot.localScale = Scaled(Vector3.one);
         }
 
         /// <summary>Parts surface-attached to this one, moved by the change of scale along each axis from appliedScale.</summary>
@@ -273,6 +290,7 @@ namespace ROLib
                 Vector3 local = part.transform.InverseTransformPoint(child.transform.position);
                 local.Scale(ratio);
                 child.transform.position = part.transform.TransformPoint(local);
+                child.attPos0 = child.transform.localPosition;   // the offset tool's zero, and what is saved
             }
         }
 
